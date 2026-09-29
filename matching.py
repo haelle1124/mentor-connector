@@ -7,7 +7,9 @@ from pathlib import Path
 
 MENTORS_PATH = Path(__file__).parent / "data" / "mentors.json"
 TOP_N = 3
-DEFAULT_MODEL = "gemini-2.5-flash"
+# 앞 모델이 혼잡(503)하거나 느리면 다음 모델을 시도한다. "-latest" 이름은 구글이 최신 모델로 자동 연결해 준다.
+DEFAULT_MODELS = ["gemini-flash-lite-latest", "gemini-flash-latest"]
+TIMEOUT_MS = 12_000
 
 # 공백을 뺀 형태로 비교한다 ("죽고 싶다" → "죽고싶다")
 CRISIS_KEYWORDS = [
@@ -96,12 +98,17 @@ def _get_api_key():
         return None
 
 
-def _get_model():
+def _get_models():
+    """secrets 또는 환경변수 GEMINI_MODEL(쉼표로 여러 개 가능)이 있으면 그것을, 없으면 기본 목록을 쓴다."""
+    value = os.environ.get("GEMINI_MODEL")
     try:
         import streamlit as st
-        return st.secrets.get("GEMINI_MODEL", os.environ.get("GEMINI_MODEL", DEFAULT_MODEL))
+        value = st.secrets.get("GEMINI_MODEL", value)
     except Exception:
-        return os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
+        pass
+    if value:
+        return [m.strip() for m in value.split(",") if m.strip()]
+    return DEFAULT_MODELS
 
 
 def ai_match(student, mentors):
@@ -124,17 +131,22 @@ def ai_match(student, mentors):
         + json.dumps(mentor_info, ensure_ascii=False)
     )
 
-    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=20_000))
-    response = client.models.generate_content(
-        model=_get_model(),
-        contents=user_prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            temperature=0.4,
-        ),
+    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=TIMEOUT_MS))
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        response_mime_type="application/json",
+        temperature=0.4,
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
-    return _parse_ai_response(response.text, {m["id"] for m in mentors})
+    last_error = None
+    for model in _get_models():
+        try:
+            response = client.models.generate_content(model=model, contents=user_prompt, config=config)
+            return _parse_ai_response(response.text, {m["id"] for m in mentors})
+        except Exception as e:
+            print(f"[{model} 실패] {type(e).__name__}: {str(e)[:200]}")
+            last_error = e
+    raise last_error
 
 
 def _parse_ai_response(text, valid_ids):
